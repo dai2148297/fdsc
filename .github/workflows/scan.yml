@@ -1,1 +1,292 @@
+name: RevScan (Reverse Proxy Shard Runner)
 
+on:
+  workflow_dispatch:
+    inputs:
+      shards_preset:
+        description: '分片机器'
+        required: true
+        type: choice
+        options:
+          - '4 台机器 (推荐 50 万以下)'
+          - '8 台机器 (极速并发，推荐 50 万以上)'
+          - 'custom (自定义台数)'
+        default: '4 台机器 (推荐 50 万以下)'
+      custom_shards:
+        description: '自定义分片机器数 (选 custom 时生效，1~20)'
+        required: false
+        default: '4'
+      port_mode:
+        description: '端口模式'
+        required: true
+        type: choice
+        options:
+          - '标准端口 (默认)'
+          - '明文端口'
+          - '加密端口'
+          - '自定义端口'
+        default: '标准端口 (默认)'
+      custom_ports:
+        description: '自定义端口 (选自定义端口时生效，支持 1234, 5678 或 1000-2000)'
+        required: false
+        default: ''
+      host:
+        description: '反代测试域名 (默认 www.cloudflare.com)'
+        required: false
+        default: 'www.cloudflare.com'
+      concur:
+        description: '深度探测并发数 (-c)'
+        required: false
+        default: '150'
+      ping_concur:
+        description: 'TCPing 预筛并发数 (-p)'
+        required: false
+        default: '1000'
+      save_mode:
+        description: '结果写回私库策略'
+        required: true
+        type: choice
+        options:
+          - 'merge (合并去重)'
+          - 'overwrite (覆盖最新)'
+        default: 'merge (合并去重)'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.calc-matrix.outputs.matrix }}
+      total_shards: ${{ steps.calc-matrix.outputs.total_shards }}
+
+    steps:
+      - name: Calculate Shard Matrix
+        id: calc-matrix
+        env:
+          INPUT_PRESET: ${{ github.event.inputs.shards_preset }}
+          INPUT_CUSTOM: ${{ github.event.inputs.custom_shards }}
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+
+          preset = os.environ.get("INPUT_PRESET", "")
+          custom = os.environ.get("INPUT_CUSTOM", "4").strip()
+
+          if "8" in preset:
+              shards = 8
+          elif "custom" in preset:
+              try:
+                  shards = int(custom)
+              except ValueError:
+                  shards = 4
+          else:
+              shards = 4
+
+          shards = max(1, min(20, shards))
+          shard_list = list(range(shards))
+          print(f"[*] 选定分片数量: {shards} 台机器")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"matrix={json.dumps(shard_list)}\n")
+              f.write(f"total_shards={shards}\n")
+          EOF
+
+  scan-matrix:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Checkout Private Repository
+        env:
+          MY_PAT: ${{ secrets.MY_PAT }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          if [ -z "$MY_PAT" ] || [ -z "$PRIVATE_REPO" ]; then
+            echo "❌ 错误: 必须在公开仓库 Settings -> Secrets 中配置 MY_PAT 与 PRIVATE_REPO！"
+            exit 1
+          fi
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$MY_PAT" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=${AUTH_HEADER}" clone --depth 1 "https://github.com/${PRIVATE_REPO}.git" private_vault
+          cp private_vault/rev_scan.go ./
+          cp private_vault/ip.txt ./
+          [ -f private_vault/go.mod ] && cp private_vault/go.mod ./ || go mod init revscan
+          rm -rf private_vault
+
+      - name: Build and Run Reverse Scanner
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: ${{ needs.generate-matrix.outputs.total_shards }}
+          INPUT_PORT_MODE: ${{ github.event.inputs.port_mode }}
+          INPUT_CUSTOM_PORTS: ${{ github.event.inputs.custom_ports }}
+          INPUT_HOST: ${{ github.event.inputs.host }}
+          INPUT_CONCUR: ${{ github.event.inputs.concur }}
+          INPUT_PING_CONCUR: ${{ github.event.inputs.ping_concur }}
+        run: |
+          # 依据 4 种端口模式设定扫描端口
+          if [[ "$INPUT_PORT_MODE" == *"明文"* ]]; then
+            PORTS="plain"
+          elif [[ "$INPUT_PORT_MODE" == *"加密"* ]]; then
+            PORTS="tls"
+          elif [[ "$INPUT_PORT_MODE" == *"自定义"* ]]; then
+            PORTS=$(printf '%s' "$INPUT_CUSTOM_PORTS" | tr -d '[:space:]')
+            [ -z "$PORTS" ] && PORTS="standard"
+          else
+            PORTS="standard"
+          fi
+
+          HOST=$(printf '%s' "$INPUT_HOST" | tr -d '[:space:]')
+          [ -z "$HOST" ] && HOST="www.cloudflare.com"
+          CONCUR=$(printf '%s' "$INPUT_CONCUR" | tr -d '[:space:]')
+          [ -z "$CONCUR" ] && CONCUR="150"
+          PING_CONCUR=$(printf '%s' "$INPUT_PING_CONCUR" | tr -d '[:space:]')
+          [ -z "$PING_CONCUR" ] && PING_CONCUR="1000"
+
+          go build -o rev_scan rev_scan.go
+
+          set +e
+          timeout -s TERM 330m ./rev_scan \
+            -quiet-hits \
+            -shard-index "$SHARD_INDEX" \
+            -shard-total "$SHARD_TOTAL" \
+            -ports "$PORTS" \
+            -host "$HOST" \
+            -c "$CONCUR" \
+            -p "$PING_CONCUR" \
+            -output "results_${SHARD_INDEX}.txt" \
+            -input ip.txt
+          rc=$?
+          set -e
+
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+            echo "[!] 扫描进程异常退出 (exit=$rc)"
+            exit "$rc"
+          fi
+
+      - name: Upload Shard Result Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "shard-${{ matrix.shard }}"
+          path: "results_${{ matrix.shard }}.txt"
+          if-no-files-found: ignore
+          retention-days: 1
+
+  merge-and-push:
+    needs: [generate-matrix, scan-matrix]
+    if: always() && needs.generate-matrix.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: shards
+
+      - name: Merge and deduplicate results
+        id: merge
+        run: |
+          echo "[*] 开始汇总并去重所有分片结果..."
+          mkdir -p temp_merge
+          find shards -type f -name "results_*.txt" -exec cat {} + > temp_merge/raw_results.txt 2>/dev/null || true
+
+          TOTAL_LINES=$(grep -v '^\s*$' temp_merge/raw_results.txt 2>/dev/null | wc -l || echo 0)
+          echo "[*] 收集到的各分片存活行数: $TOTAL_LINES"
+
+          if [ "$TOTAL_LINES" -gt 0 ]; then
+            grep -v '^\s*$' temp_merge/raw_results.txt | sort -u > results.txt
+            ALIVE_COUNT=$(wc -l < results.txt)
+            echo "[+] 本次收集到存活反代: $ALIVE_COUNT"
+            echo "has_alive=true" >> "$GITHUB_OUTPUT"
+            echo "count=$ALIVE_COUNT" >> "$GITHUB_OUTPUT"
+          else
+            echo "[-] 本次收集到的存活数为 0，不执行更新！"
+            echo "has_alive=false" >> "$GITHUB_OUTPUT"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get current date
+        id: date
+        run: |
+          echo "date=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+
+      - name: Push results back to Private Repository
+        if: steps.merge.outputs.has_alive == 'true'
+        env:
+          MY_PAT: ${{ secrets.MY_PAT }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+          SAVE_MODE: ${{ github.event.inputs.save_mode }}
+          CUR_DATE: ${{ steps.date.outputs.date }}
+        run: |
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$MY_PAT" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=${AUTH_HEADER}" clone --depth 1 "https://github.com/${PRIVATE_REPO}.git" target_repo
+
+          cd target_repo
+          CUR_BRANCH=$(git symbolic-ref --short HEAD)
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          merge_results() {
+            if [[ "$SAVE_MODE" == merge* ]] && [ -f results.txt ]; then
+              cat ../results.txt results.txt | grep -v '^\s*$' | sort -u > results_merged.txt
+              mv results_merged.txt results.txt
+            else
+              cp ../results.txt results.txt
+            fi
+          }
+
+          merge_results
+          git add results.txt
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-update results.txt (${CUR_DATE}) [skip ci]"
+            if ! git -c "http.https://github.com/.extraheader=${AUTH_HEADER}" push origin "HEAD:${CUR_BRANCH}"; then
+              echo "[*] 检测到远端并发更新，重新拉取合并后推送..."
+              git -c "http.https://github.com/.extraheader=${AUTH_HEADER}" fetch origin "${CUR_BRANCH}"
+              git reset --hard "origin/${CUR_BRANCH}"
+              merge_results
+              git add results.txt
+              if ! git diff --staged --quiet; then
+                git commit -m "Auto-update results.txt (${CUR_DATE}) [skip ci]"
+                git -c "http.https://github.com/.extraheader=${AUTH_HEADER}" push origin "HEAD:${CUR_BRANCH}"
+              fi
+            fi
+          else
+            echo "[*] 结果无变动，无需提交。"
+          fi
+          cd ..
+          rm -rf target_repo
+
+      - name: Clean artifacts and old workflow runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "[*] 销毁本次分片产物与历史运行记录..."
+          TARGET_REPO="${GITHUB_REPOSITORY}"
+
+          gh api --paginate "repos/${TARGET_REPO}/actions/runs/${CURRENT_RUN_ID}/artifacts" --jq '.artifacts[].id' 2>/dev/null | while read -r aid; do
+            if [ -n "$aid" ]; then
+              gh api -X DELETE "repos/${TARGET_REPO}/actions/artifacts/${aid}" >/dev/null 2>&1 || true
+            fi
+          done
+
+          gh run list --repo "$TARGET_REPO" --limit 100 --json databaseId --jq ".[] | select(.databaseId != ${CURRENT_RUN_ID}) | .databaseId" 2>/dev/null | while read -r id; do
+            if [ -n "$id" ]; then
+              gh run delete --repo "$TARGET_REPO" "$id" >/dev/null 2>&1 || true
+            fi
+          done
+          echo "[+] 清理完成！"
